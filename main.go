@@ -168,6 +168,7 @@ ALLOW (is_brainrot=false):
 - Quality children's shows: Bluey, Puffin Rock, Numberblocks, Octonauts, Magic School Bus, Wild Kratts, Sesame Street, Daniel Tiger, Peppa Pig, Hey Duggee, Storybots, Ask the Storybots
 - Educational content: science experiments, nature/animal videos, art/drawing tutorials, reading/phonics, math for kids
 - Calm Minecraft: building tutorials, survival let's plays without clickbait titles, redstone guides
+- Parent-approved Minecraft YouTubers: Aphmau, Maizen — always allow these channels regardless of title
 - Music: children's songs, nursery rhymes, Raffi, They Might Be Giants, Caspar Babypants, movie/show soundtracks
 - Creative content: drawing tutorials, craft/maker videos, LEGO building guides, cooking with kids
 - Nature documentaries and animal content (National Geographic Kids, BBC Earth, etc.)
