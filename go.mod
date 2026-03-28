@@ -1,4 +1,4 @@
-module github.com/trevorprater/brainrot-detection
+module github.com/fugue-labs/brainrot-detection
 
 go 1.25.6
 
