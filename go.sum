@@ -1,0 +1,17 @@
+github.com/d6o/goyoutubelounge v0.0.0-20260216190926-382aa8049a15 h1:4dvBDQCv7YAcAxmR+FXAmhVhqiDNx+x76Ps9LiR+SSg=
+github.com/d6o/goyoutubelounge v0.0.0-20260216190926-382aa8049a15/go.mod h1:sqrcD/kBEd4p0amGIsw/K08FB3KmfNaJR+bK9+Fa9o8=
+github.com/fugue-labs/gollem v0.3.1 h1:Kq35px669/BNCpIaDIr1YTZOQ32xKySG8EFyg9b442w=
+github.com/fugue-labs/gollem v0.3.1/go.mod h1:TgOCoiGTE4THJPyZb+UEl0QtpzYAq69kwhbHbHZq/xg=
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/gorilla/websocket v1.4.0/go.mod h1:E7qHFY5m1UJ88s3WnNqhKjPHQ0heANvMoAMk2YaljkQ=
+github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=
+github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
+github.com/mitchellh/mapstructure v1.1.2 h1:fmNYVwqnSfB9mZU6OS2O6GsXM+wcskZDuKQzvN1EDeE=
+github.com/mitchellh/mapstructure v1.1.2/go.mod h1:FVVH3fgwuzCH5S8UJGiWEs2h04kUh9fWfEaFds41c1Y=
+github.com/pkg/errors v0.8.1 h1:iURUrRGxPUNPdy5/HRSm+Yj6okJ6UtLINN0Q9M4+h3I=
+github.com/pkg/errors v0.8.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+github.com/snabb/webostv v0.0.1 h1:q5+QSatpvVLuCE+WSyjqN5ecZrGKOodaB3BLK0Xzbkw=
+github.com/snabb/webostv v0.0.1/go.mod h1:6lXsDerBhrG9YzVpoQi6r+BOOgvgCH1PICA0CamfoAs=
+go.uber.org/mock v0.6.0 h1:hyF9dfmbgIX5EfOdasqLsWD6xqpNZlXblLB/Dbnwv3Y=
+go.uber.org/mock v0.6.0/go.mod h1:KiVJ4BqZJaMj4svdfmHM0AUx4NJYO8ZNpPnZn1Z+BBU=

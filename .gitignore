@@ -1,0 +1,10 @@
+config.json
+brainrot
+brainrot-detection
+__pycache__/
+.venv/
+*.pyc
+
+# Python prototype (kept in git history, not in main tree)
+brainrot_agent.py
+requirements.txt
