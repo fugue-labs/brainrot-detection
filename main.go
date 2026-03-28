@@ -44,13 +44,18 @@ type Config struct {
 }
 
 var defaultConfig = Config{
-	SonosIP:          "192.168.0.167",
-	LGTVIP:           "192.168.0.233",
-	LGTVKey:          "dcd1741694714a3c412105c2aa34b1cc",
+	SonosIP:          "",
+	LGTVIP:           "",
+	LGTVKey:          "",
 	WarningDelaySecs: 10,
 }
 
 func configPath() string {
+	// Check working directory first, then fall back to executable directory
+	if _, err := os.Stat("config.json"); err == nil {
+		abs, _ := filepath.Abs("config.json")
+		return abs
+	}
 	exe, _ := os.Executable()
 	return filepath.Join(filepath.Dir(exe), "config.json")
 }
@@ -105,6 +110,7 @@ func newClassifier() (*core.Agent[BrainrotClassification], error) {
 		openaiprovider.WithChatGPTAuth(creds.AccessToken, creds.AccountID),
 		openaiprovider.WithModel("gpt-5.4"),
 		openaiprovider.WithMaxTokens(256),
+		openaiprovider.WithPromptCacheKey("brainrot-classifier"),
 		openaiprovider.WithTokenRefresher(func() (string, error) {
 			refreshed, err := openaiauth.RefreshIfNeeded(creds)
 			if err != nil {
@@ -182,6 +188,8 @@ type videoMeta struct {
 	Description string
 }
 
+var metaClient = &http.Client{Timeout: 10 * time.Second}
+
 func fetchVideoMeta(videoID string) (*videoMeta, error) {
 	// Fetch the YouTube watch page and extract meta tags.
 	// This gives us title, channel, and description with no API key.
@@ -190,7 +198,7 @@ func fetchVideoMeta(videoID string) (*videoMeta, error) {
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := metaClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -358,7 +366,11 @@ func startHTTPServer() {
 			w.Header().Set("Content-Type", "audio/mpeg")
 			w.Write(warningMP3)
 		})
-		go http.ListenAndServe(fmt.Sprintf(":%d", httpPort), mux)
+		go func() {
+			if err := http.ListenAndServe(fmt.Sprintf(":%d", httpPort), mux); err != nil {
+				log.Fatalf("Warning audio server failed to start on port %d: %v", httpPort, err)
+			}
+		}()
 	})
 }
 
@@ -410,23 +422,140 @@ func playWarningOnSonos(sonosIP string) error {
 }
 
 // ---------------------------------------------------------------------------
-// LG TV control
+// LG TV control — persistent connection with background keepalive
 // ---------------------------------------------------------------------------
 
-func turnOffTV(tvIP, clientKey string) error {
-	slog.Warn("TURNING OFF THE TV")
-	tv, err := webostv.DefaultDialer.Dial(tvIP)
-	if err != nil {
-		return fmt.Errorf("dial TV: %w", err)
+type tvController struct {
+	ip        string
+	clientKey string
+	tv        *webostv.Tv
+	mu        sync.Mutex
+}
+
+func newTVController(ip, clientKey string) *tvController {
+	return &tvController{ip: ip, clientKey: clientKey}
+}
+
+// connect dials and registers with the TV. Caller must hold tc.mu.
+func (tc *tvController) connect() error {
+	if tc.tv != nil {
+		tc.tv.Close()
+		tc.tv = nil
 	}
-	defer tv.Close()
+	tv, err := webostv.DefaultDialer.Dial(tc.ip)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
 	go tv.MessageHandler()
 
-	if _, err := tv.Register(clientKey); err != nil {
-		return fmt.Errorf("register TV: %w", err)
+	if _, err := tv.Register(tc.clientKey); err != nil {
+		tv.Close()
+		return fmt.Errorf("register: %w", err)
+	}
+	tc.tv = tv
+	return nil
+}
+
+// keepAlive runs in the background, maintaining a connection to the TV.
+// It reconnects every 30 seconds if the connection is lost.
+func (tc *tvController) keepAlive(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	wasConnected := false
+
+	// Initial connection
+	tc.mu.Lock()
+	if err := tc.connect(); err != nil {
+		slog.Debug("TV not reachable yet", "error", err)
+	} else {
+		slog.Info("TV connection established")
+		tc.tv.SystemNotificationsCreateToast("Brainrot Detection is now active.")
+		wasConnected = true
+	}
+	tc.mu.Unlock()
+
+	for {
+		select {
+		case <-ctx.Done():
+			tc.mu.Lock()
+			if tc.tv != nil {
+				tc.tv.SystemNotificationsCreateToast("Brainrot Detection is shutting down.")
+				time.Sleep(500 * time.Millisecond) // let the toast send before closing
+				tc.tv.Close()
+				tc.tv = nil
+			}
+			tc.mu.Unlock()
+			return
+		case <-ticker.C:
+			tc.mu.Lock()
+			// Test the connection by getting foreground app info
+			if tc.tv != nil {
+				_, err := tc.tv.ApplicationManagerGetForegroundAppInfo()
+				if err != nil {
+					slog.Debug("TV connection stale, reconnecting", "error", err)
+					tc.tv.Close()
+					tc.tv = nil
+					wasConnected = false
+				}
+			}
+			if tc.tv == nil {
+				if err := tc.connect(); err != nil {
+					slog.Debug("TV reconnect failed", "error", err)
+				} else {
+					if !wasConnected {
+						slog.Info("TV reconnected")
+						tc.tv.SystemNotificationsCreateToast("Brainrot Detection reconnected.")
+					}
+					wasConnected = true
+				}
+			}
+			tc.mu.Unlock()
+		}
+	}
+}
+
+func (tc *tvController) turnOff() error {
+	slog.Warn("TURNING OFF THE TV")
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	for attempt := range 3 {
+		// Use existing connection or establish a new one
+		if tc.tv == nil {
+			if err := tc.connect(); err != nil {
+				slog.Warn("TV dial failed, retrying", "attempt", attempt+1, "error", err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+		}
+
+		err := tc.tv.SystemTurnOff()
+		if err == nil {
+			slog.Info("TV has been turned off.")
+			tc.tv.Close()
+			tc.tv = nil
+			return nil
+		}
+
+		slog.Warn("TV power-off failed, retrying", "attempt", attempt+1, "error", err)
+		tc.tv.Close()
+		tc.tv = nil
+		time.Sleep(2 * time.Second)
 	}
 
-	return tv.SystemTurnOff()
+	return fmt.Errorf("failed to turn off TV after 3 attempts")
+}
+
+func (tc *tvController) showToast(msg string) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.tv == nil {
+		return
+	}
+	if _, err := tc.tv.SystemNotificationsCreateToast(msg); err != nil {
+		slog.Debug("Toast failed", "error", err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -436,36 +565,35 @@ func turnOffTV(tvIP, clientKey string) error {
 type brainrotMonitor struct {
 	cfg           Config
 	classifier    *core.Agent[BrainrotClassification]
-	lastVideoID   string        // most recent video we saw
-	activeWarning bool          // a warning/shutdown sequence is in progress
-	warningCancel context.CancelFunc
-	clearedOK     bool          // set true when a non-brainrot video is confirmed during countdown
-	warnedVideos  map[string]bool
+	tv            *tvController
+	lastVideoID   string             // most recent video we saw
+	activeWarning bool               // a warning/shutdown sequence is in progress
+	warningCancel context.CancelFunc // cancels the warning countdown
+	warningDone   chan struct{}       // closed when warnAndShutdown goroutine exits
 	mu            sync.Mutex
 }
 
 func (m *brainrotMonitor) handleNowPlaying(ctx context.Context, e *event.NowPlayingEvent) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Ignore empty / stopped — these are transient Lounge events (buffering, seeking, pausing).
-	// They do NOT mean the user navigated away.
+	// Ignore empty — transient Lounge event (buffering, seeking, pausing).
 	if e.VideoID == "" {
 		return
 	}
 
-	// Same video — ignore (could be seek, pause/resume, buffering)
+	// Check if this is a new video (lock briefly, don't hold during network calls)
+	m.mu.Lock()
 	if e.VideoID == m.lastVideoID {
+		m.mu.Unlock()
 		return
 	}
 	m.lastVideoID = e.VideoID
+	m.mu.Unlock()
 
 	var duration float64
 	if e.Duration != nil {
 		duration = *e.Duration
 	}
 
-	// Fetch actual video metadata from YouTube
+	// Fetch actual video metadata from YouTube (no mutex held)
 	title, channel, description := e.VideoID, "unknown", ""
 	meta, err := fetchVideoMeta(e.VideoID)
 	if err != nil {
@@ -484,13 +612,15 @@ func (m *brainrotMonitor) handleNowPlaying(ctx context.Context, e *event.NowPlay
 		"state", e.State,
 	)
 
-	// Use LLM to classify with real metadata
-	classification, classErr := classifyVideo(ctx, m.classifier,
+	// Use LLM to classify with real metadata (no mutex held — this takes seconds)
+	classCtx, classCancel := context.WithTimeout(ctx, 30*time.Second)
+	classification, classErr := classifyVideo(classCtx, m.classifier,
 		title,
 		channel,
 		duration,
 		[]string{description},
 	)
+	classCancel()
 
 	isShort := duration > 0 && duration <= 61
 
@@ -506,6 +636,15 @@ func (m *brainrotMonitor) handleNowPlaying(ctx context.Context, e *event.NowPlay
 		}
 	}
 
+	// Now take the lock to update state
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Check that this video is still the current one (could have changed during classification)
+	if e.VideoID != m.lastVideoID {
+		return
+	}
+
 	if classification.IsBrainrot {
 		slog.Warn("BRAINROT DETECTED",
 			"video_id", e.VideoID,
@@ -516,14 +655,14 @@ func (m *brainrotMonitor) handleNowPlaying(ctx context.Context, e *event.NowPlay
 
 		// Start warning if not already in a warning sequence
 		if !m.activeWarning {
+			// If a previous goroutine is still finishing, wait for it
+			m.waitForWarningDone()
 			m.activeWarning = true
-			m.clearedOK = false
 			warnCtx, cancel := context.WithCancel(ctx)
 			m.warningCancel = cancel
+			m.warningDone = make(chan struct{})
 			go m.warnAndShutdown(warnCtx)
 		}
-		// If already warning, let it continue — switching between brainrot videos
-		// doesn't earn a reprieve.
 	} else {
 		slog.Info("Content OK",
 			"video_id", e.VideoID,
@@ -531,16 +670,19 @@ func (m *brainrotMonitor) handleNowPlaying(ctx context.Context, e *event.NowPlay
 			"reason", classification.Reason,
 		)
 		// Only cancel an active warning if we see confirmed non-brainrot content.
-		// This is the ONLY way to cancel a warning.
 		if m.activeWarning {
 			slog.Info("Non-brainrot content confirmed — cancelling warning")
-			m.clearedOK = true
-			m.cancelWarning()
+			m.stopWarning()
 		}
 	}
 }
 
 func (m *brainrotMonitor) warnAndShutdown(ctx context.Context) {
+	defer close(m.warningDone)
+
+	// Show visual warning on TV screen
+	m.tv.showToast("BRAINROT DETECTED. Change what you're watching or the TV will turn off in 10 seconds.")
+
 	// Play warning audio — this is not cancellable, it always plays through
 	if err := playWarningOnSonos(m.cfg.SonosIP); err != nil {
 		slog.Error("Failed to play warning", "error", err)
@@ -550,36 +692,63 @@ func (m *brainrotMonitor) warnAndShutdown(ctx context.Context) {
 	slog.Info("Countdown started", "seconds", m.cfg.WarningDelaySecs)
 	select {
 	case <-ctx.Done():
-		m.mu.Lock()
-		m.activeWarning = false
-		m.mu.Unlock()
 		slog.Info("Warning cancelled — non-brainrot content detected")
 		return
 	case <-time.After(time.Duration(m.cfg.WarningDelaySecs) * time.Second):
 	}
 
+	// Check if we were cancelled right at the deadline (race between timer and cancel)
+	select {
+	case <-ctx.Done():
+		slog.Info("Warning cancelled — non-brainrot content detected")
+		return
+	default:
+	}
+
+	// Final check — context could have been cancelled between timer firing and here
 	m.mu.Lock()
-	cleared := m.clearedOK
+	if !m.activeWarning {
+		m.mu.Unlock()
+		slog.Info("Warning was cancelled just in time")
+		return
+	}
 	m.activeWarning = false
 	m.mu.Unlock()
 
-	if cleared {
-		slog.Info("Content changed during countdown. Crisis averted.")
-		return
-	}
-
 	// Time's up. Turn off the TV.
 	slog.Warn("Time's up. Turning off TV.")
-	if err := turnOffTV(m.cfg.LGTVIP, m.cfg.LGTVKey); err != nil {
+	if err := m.tv.turnOff(); err != nil {
 		slog.Error("Failed to turn off TV", "error", err)
 	}
 }
 
-func (m *brainrotMonitor) cancelWarning() {
+// stopWarning cancels the active warning and waits for the goroutine to exit.
+// Caller must hold m.mu.
+func (m *brainrotMonitor) stopWarning() {
 	if m.warningCancel != nil {
 		m.warningCancel()
 		m.warningCancel = nil
 	}
+	m.activeWarning = false
+	// Release lock while waiting so the goroutine can acquire it to clean up
+	done := m.warningDone
+	m.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+	m.mu.Lock()
+}
+
+// waitForWarningDone waits for a previous warning goroutine to finish.
+// Caller must hold m.mu.
+func (m *brainrotMonitor) waitForWarningDone() {
+	done := m.warningDone
+	if done == nil {
+		return
+	}
+	m.mu.Unlock()
+	<-done
+	m.mu.Lock()
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +761,10 @@ func main() {
 	})))
 
 	cfg := loadConfig()
+
+	if cfg.SonosIP == "" || cfg.LGTVIP == "" {
+		log.Fatalf("Config incomplete: sonos_ip and lg_tv_ip are required.\nCopy config.sample.json to config.json and fill in your device IPs.")
+	}
 
 	slog.Info("Initializing brainrot classifier...")
 	classifier, err := newClassifier()
@@ -647,10 +820,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
+	tvCtrl := newTVController(cfg.LGTVIP, cfg.LGTVKey)
+	go tvCtrl.keepAlive(ctx)
+
 	monitor := &brainrotMonitor{
 		cfg:          cfg,
 		classifier:   classifier,
-		warnedVideos: make(map[string]bool),
+		tv:           tvCtrl,
 	}
 
 	// Reconnect loop — when the TV turns off or YouTube closes, the Lounge
@@ -708,9 +884,10 @@ func main() {
 		// Event channel closed — session is dead. Reset warning state and reconnect.
 		slog.Warn("Lounge session ended — will reconnect in 5 seconds...")
 		monitor.mu.Lock()
-		monitor.activeWarning = false
 		monitor.lastVideoID = ""
-		monitor.cancelWarning()
+		if monitor.activeWarning {
+			monitor.stopWarning()
+		}
 		monitor.mu.Unlock()
 
 		select {
