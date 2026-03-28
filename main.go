@@ -527,8 +527,15 @@ func playAudioOnSonos(sonosIP string, audio []byte) error {
 	sonosSetAVTransportURI(sonosIP, audioURL, "")
 	sonosPlay(sonosIP)
 
-	// Wait for it to finish
-	time.Sleep(9 * time.Second)
+	// Wait for playback to finish by polling transport state
+	time.Sleep(1 * time.Second) // give Sonos a moment to start
+	for range 30 {              // poll up to 30 seconds max
+		state, err := sonosGetTransportState(sonosIP)
+		if err != nil || state != "PLAYING" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 
 	// Restore original volume and input
 	sonosSetVolume(sonosIP, vol)
@@ -547,14 +554,15 @@ func playAudioOnSonos(sonosIP string, audio []byte) error {
 // ---------------------------------------------------------------------------
 
 type tvController struct {
-	ip        string
-	clientKey string
-	tv        *webostv.Tv
-	mu        sync.Mutex
+	ip          string
+	clientKey   string
+	tv          *webostv.Tv
+	reconnectCh chan struct{} // signal to accelerate reconnect attempts
+	mu          sync.Mutex
 }
 
 func newTVController(ip, clientKey string) *tvController {
-	return &tvController{ip: ip, clientKey: clientKey}
+	return &tvController{ip: ip, clientKey: clientKey, reconnectCh: make(chan struct{}, 1)}
 }
 
 // connect dials and registers with the TV. Caller must hold tc.mu.
@@ -602,15 +610,36 @@ func (tc *tvController) keepAlive(ctx context.Context) {
 			tc.mu.Lock()
 			if tc.tv != nil {
 				tc.tv.SystemNotificationsCreateToast("Brainrot Detection is shutting down.")
-				time.Sleep(500 * time.Millisecond) // let the toast send before closing
+				time.Sleep(500 * time.Millisecond)
 				tc.tv.Close()
 				tc.tv = nil
 			}
 			tc.mu.Unlock()
 			return
+		case <-tc.reconnectCh:
+			// Urgent reconnect requested (e.g. after TV shutoff)
+			// Poll aggressively every 5 seconds for up to 2 minutes
+			slog.Info("TV reconnect requested — polling aggressively")
+			for range 24 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(5 * time.Second):
+				}
+				tc.mu.Lock()
+				if tc.tv == nil {
+					if err := tc.connect(); err == nil {
+						slog.Info("TV reconnected")
+						tc.tv.SystemNotificationsCreateToast("Brainrot Detection reconnected.")
+						wasConnected = true
+						tc.mu.Unlock()
+						break
+					}
+				}
+				tc.mu.Unlock()
+			}
 		case <-ticker.C:
 			tc.mu.Lock()
-			// Test the connection by getting foreground app info
 			if tc.tv != nil {
 				_, err := tc.tv.ApplicationManagerGetForegroundAppInfo()
 				if err != nil {
@@ -656,6 +685,11 @@ func (tc *tvController) turnOff() error {
 			slog.Info("TV has been turned off.")
 			tc.tv.Close()
 			tc.tv = nil
+			// Signal keepAlive to start aggressive reconnect polling
+			select {
+			case tc.reconnectCh <- struct{}{}:
+			default:
+			}
 			return nil
 		}
 
