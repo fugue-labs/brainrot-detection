@@ -397,18 +397,19 @@ func sonosPlay(sonosIP string) error {
 
 var (
 	httpPort       = 8769
+	httpMux        = http.NewServeMux()
 	httpServerOnce sync.Once
 )
 
 func startHTTPServer() {
 	httpServerOnce.Do(func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/warning.mp3", func(w http.ResponseWriter, r *http.Request) {
+		httpMux.HandleFunc("/warning.mp3", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "audio/mpeg")
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(warningMP3)))
 			w.Write(warningMP3)
 		})
 		go func() {
-			if err := http.ListenAndServe(fmt.Sprintf(":%d", httpPort), mux); err != nil {
+			if err := http.ListenAndServe(fmt.Sprintf(":%d", httpPort), httpMux); err != nil {
 				log.Fatalf("Warning audio server failed to start on port %d: %v", httpPort, err)
 			}
 		}()
@@ -472,15 +473,13 @@ func generateWarningTTS(apiKey, voiceID, message string) []byte {
 
 // playWarningAudio plays either dynamic TTS or the embedded fallback on Sonos.
 func playWarningAudio(cfg Config, reason string) error {
-	// Try dynamic TTS with a contextual message
-	var warningMsg string
+	// Build a contextual warning message
+	warningMsg := "Attention. Brainrot content has been detected. You have ten seconds to change what you are watching, or the TV will be turned off."
 	if reason != "" {
 		warningMsg = fmt.Sprintf(
-			"Attention. Brainrot has been detected. %s. You have ten seconds to change what you are watching, or the TV will be turned off.",
+			"Attention. Brainrot content has been detected. %s. You have ten seconds to switch to something appropriate, or the TV will be turned off.",
 			reason,
 		)
-	} else {
-		warningMsg = "Attention. Brainrot content has been detected. You have ten seconds to change what you are watching, or the TV will be turned off."
 	}
 
 	audio := generateWarningTTS(cfg.ElevenLabsAPIKey, cfg.ElevenLabsVoiceID, warningMsg)
@@ -502,9 +501,11 @@ func playAudioOnSonos(sonosIP string, audio []byte) error {
 	path := fmt.Sprintf("/warning-%d.mp3", time.Now().UnixNano())
 	audioURL := fmt.Sprintf("http://%s:%d%s", localIP, httpPort, path)
 
-	// Register a temporary handler
-	http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+	// Register a temporary handler on the shared mux
+	audioLen := len(audio)
+	httpMux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "audio/mpeg")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", audioLen))
 		w.Write(audio)
 	})
 
@@ -517,8 +518,8 @@ func playAudioOnSonos(sonosIP string, audio []byte) error {
 	mediaInfo, _ := sonosGetMediaInfo(sonosIP)
 	transportState, _ := sonosGetTransportState(sonosIP)
 
-	// Bump volume 30% for warning
-	warningVol := min(100, int(float64(vol)*1.3))
+	// Bump volume significantly for warning
+	warningVol := min(100, max(30, int(float64(vol)*1.8)))
 	slog.Info("Volume", "current", vol, "warning", warningVol)
 	sonosSetVolume(sonosIP, warningVol)
 
@@ -765,6 +766,9 @@ type brainrotMonitor struct {
 // screenCheckLoop periodically screenshots the TV and classifies what's on screen.
 // This catches brainrot outside YouTube (Roblox, Netflix, etc.).
 func (m *brainrotMonitor) screenCheckLoop(ctx context.Context) {
+	// Classify immediately on startup
+	m.classifyScreen(ctx)
+
 	interval := time.Duration(m.cfg.ScreenCheckInterval) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
