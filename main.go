@@ -166,6 +166,8 @@ FLAG AS BRAINROT (is_brainrot=true):
 
 ALLOW (is_brainrot=false):
 - Quality children's shows: Bluey, Puffin Rock, Numberblocks, Octonauts, Magic School Bus, Wild Kratts, Sesame Street, Daniel Tiger, Peppa Pig, Hey Duggee, Storybots, Ask the Storybots
+- Cartoons and animated series from real studios: Teen Titans, Teen Titans Go, Paw Patrol, Sheriff Labrador, Powerpuff Girls, SpongeBob, Avatar: The Last Airbender, Gravity Falls, Adventure Time, Steven Universe, The Fairly OddParents, Kim Possible, Dexter's Laboratory, Johnny Bravo, Courage the Cowardly Dog, Tom and Jerry, Looney Tunes, Scooby-Doo, Pokemon, and similar legitimate animated TV shows
+- The key distinction: real TV shows produced by actual studios (Cartoon Network, Nickelodeon, Disney, PBS, Netflix originals) are ALWAYS fine. The problem is algorithm-driven YouTube-native garbage, not professional television.
 - Educational content: science experiments, nature/animal videos, art/drawing tutorials, reading/phonics, math for kids
 - Calm Minecraft: building tutorials, survival let's plays without clickbait titles, redstone guides
 - Parent-approved Minecraft YouTubers: Aphmau, Maizen — always allow these channels regardless of title
