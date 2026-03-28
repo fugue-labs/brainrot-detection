@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	crypto_tls "crypto/tls"
 	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -36,18 +39,22 @@ var warningMP3 []byte
 // ---------------------------------------------------------------------------
 
 type Config struct {
-	SonosIP          string             `json:"sonos_ip"`
-	LGTVIP           string             `json:"lg_tv_ip"`
-	LGTVKey          string             `json:"lg_tv_key"`
-	WarningDelaySecs int                `json:"warning_delay_seconds"`
-	LoungeAuth       *auth.AuthStateData `json:"lounge_auth,omitempty"`
+	SonosIP             string             `json:"sonos_ip"`
+	LGTVIP              string             `json:"lg_tv_ip"`
+	LGTVKey             string             `json:"lg_tv_key"`
+	WarningDelaySecs    int                `json:"warning_delay_seconds"`
+	ScreenCheckInterval int                `json:"screen_check_interval_seconds,omitempty"` // 0 = disabled
+	ElevenLabsAPIKey    string             `json:"elevenlabs_api_key,omitempty"`
+	ElevenLabsVoiceID   string             `json:"elevenlabs_voice_id,omitempty"`
+	LoungeAuth          *auth.AuthStateData `json:"lounge_auth,omitempty"`
 }
 
 var defaultConfig = Config{
-	SonosIP:          "",
-	LGTVIP:           "",
-	LGTVKey:          "",
-	WarningDelaySecs: 10,
+	SonosIP:             "",
+	LGTVIP:              "",
+	LGTVKey:             "",
+	WarningDelaySecs:    10,
+	ScreenCheckInterval: 0,
 }
 
 func configPath() string {
@@ -86,7 +93,16 @@ type BrainrotClassification struct {
 	Reason     string `json:"reason" jsonschema:"description=Brief explanation of why this is or is not brainrot"`
 }
 
-func newClassifier() (*core.Agent[BrainrotClassification], error) {
+// ScreenClassification is the structured output from visual TV classification.
+type ScreenClassification struct {
+	App         string `json:"app" jsonschema:"description=What app or game is running (e.g. Roblox, YouTube, Netflix, Minecraft)"`
+	Content     string `json:"content" jsonschema:"description=Brief description of what is on screen"`
+	IsBrainrot  bool   `json:"is_brainrot" jsonschema:"description=Whether the on-screen content is brainrot"`
+	AgeAppropriate bool `json:"age_appropriate" jsonschema:"description=Whether the content is appropriate for a 6-year-old"`
+	Reason      string `json:"reason" jsonschema:"description=Brief explanation of the classification"`
+}
+
+func newProvider() (*openaiprovider.Provider, error) {
 	creds, err := openaiauth.LoadCredentials()
 	if err != nil {
 		slog.Info("No saved ChatGPT credentials. Starting OAuth login...")
@@ -106,10 +122,10 @@ func newClassifier() (*core.Agent[BrainrotClassification], error) {
 		_ = openaiauth.SaveCredentials(creds)
 	}
 
-	provider := openaiprovider.New(
+	return openaiprovider.New(
 		openaiprovider.WithChatGPTAuth(creds.AccessToken, creds.AccountID),
 		openaiprovider.WithModel("gpt-5.4"),
-		openaiprovider.WithMaxTokens(256),
+		openaiprovider.WithMaxTokens(512),
 		openaiprovider.WithPromptCacheKey("brainrot-classifier"),
 		openaiprovider.WithTokenRefresher(func() (string, error) {
 			refreshed, err := openaiauth.RefreshIfNeeded(creds)
@@ -120,8 +136,10 @@ func newClassifier() (*core.Agent[BrainrotClassification], error) {
 			_ = openaiauth.SaveCredentials(creds)
 			return creds.AccessToken, nil
 		}),
-	)
+	), nil
+}
 
+func newClassifier(provider core.Model) *core.Agent[BrainrotClassification] {
 	agent := core.NewAgent[BrainrotClassification](provider,
 		core.WithSystemPrompt[BrainrotClassification](`You are a parental content filter for a 6-year-old child's YouTube viewing. You classify videos as harmful ("brainrot") or acceptable.
 
@@ -163,7 +181,30 @@ When in doubt, FLAG IT. It is better to be overprotective than to let garbage th
 You will be given a video title, channel name, duration, and description/tags. Classify it.`),
 	)
 
-	return agent, nil
+	return agent
+}
+
+func newScreenClassifier(provider core.Model) *core.Agent[ScreenClassification] {
+	return core.NewAgent[ScreenClassification](provider,
+		core.WithSystemPrompt[ScreenClassification](`You are a parental content analyzer. You will be shown a screenshot of a TV screen.
+
+Identify what app or game is running, describe what's on screen, and classify whether it is appropriate for a 6-year-old child.
+
+FLAG AS BRAINROT:
+- Roblox games that are clickbait, violent, or overstimulating (Blox Fruits combat, Brookhaven drama, etc.)
+- YouTube showing Shorts, TikTok compilations, or low-effort content
+- Any violent, scary, or age-inappropriate content
+- Chaotic, overstimulating games with excessive visual noise
+
+ALLOW:
+- Calm creative games (Minecraft building, drawing apps, puzzle games)
+- Educational apps and content
+- Quality children's shows (Bluey, Peppa Pig, etc.)
+- Age-appropriate movies and music
+- Roblox games that are calm/creative (building, roleplay without drama)
+
+Describe what you see accurately and concisely.`),
+	)
 }
 
 func classifyVideo(ctx context.Context, agent *core.Agent[BrainrotClassification], title, channel string, durationSecs float64, tags []string) (*BrainrotClassification, error) {
@@ -383,10 +424,89 @@ func getLocalIP() string {
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 
-func playWarningOnSonos(sonosIP string) error {
-	slog.Info("Playing warning on Sonos")
+
+// ---------------------------------------------------------------------------
+// Dynamic TTS via ElevenLabs (falls back to embedded warning.mp3)
+// ---------------------------------------------------------------------------
+
+// generateWarningTTS calls ElevenLabs to generate a custom warning message.
+// Returns the audio bytes, or nil if ElevenLabs is not configured / fails.
+func generateWarningTTS(apiKey, voiceID, message string) []byte {
+	if apiKey == "" {
+		return nil
+	}
+	if voiceID == "" {
+		voiceID = "onwK4e9ZLuTAKqWW03F9" // Daniel — British broadcaster
+	}
+
+	url := fmt.Sprintf("https://api.elevenlabs.io/v1/text-to-speech/%s", voiceID)
+	body, _ := json.Marshal(map[string]any{
+		"text":     message,
+		"model_id": "eleven_v3",
+	})
+
+	req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("xi-api-key", apiKey)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		slog.Warn("ElevenLabs TTS failed", "error", err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		slog.Warn("ElevenLabs TTS error", "status", resp.StatusCode)
+		return nil
+	}
+
+	audio, err := io.ReadAll(resp.Body)
+	if err != nil {
+		slog.Warn("ElevenLabs TTS read failed", "error", err)
+		return nil
+	}
+	return audio
+}
+
+// playWarningAudio plays either dynamic TTS or the embedded fallback on Sonos.
+func playWarningAudio(cfg Config, reason string) error {
+	// Try dynamic TTS with a contextual message
+	var warningMsg string
+	if reason != "" {
+		warningMsg = fmt.Sprintf(
+			"Attention. Brainrot has been detected. %s. You have ten seconds to change what you are watching, or the TV will be turned off.",
+			reason,
+		)
+	} else {
+		warningMsg = "Attention. Brainrot content has been detected. You have ten seconds to change what you are watching, or the TV will be turned off."
+	}
+
+	audio := generateWarningTTS(cfg.ElevenLabsAPIKey, cfg.ElevenLabsVoiceID, warningMsg)
+	if audio != nil {
+		slog.Info("Playing dynamic TTS warning on Sonos")
+		return playAudioOnSonos(cfg.SonosIP, audio)
+	}
+
+	// Fallback to embedded MP3
+	slog.Info("Playing embedded warning on Sonos")
+	return playAudioOnSonos(cfg.SonosIP, warningMP3)
+}
+
+// playAudioOnSonos plays raw audio bytes on the Sonos, then restores TV audio.
+func playAudioOnSonos(sonosIP string, audio []byte) error {
 	localIP := getLocalIP()
-	audioURL := fmt.Sprintf("http://%s:%d/warning.mp3", localIP, httpPort)
+
+	// Serve this specific audio on a one-shot path
+	path := fmt.Sprintf("/warning-%d.mp3", time.Now().UnixNano())
+	audioURL := fmt.Sprintf("http://%s:%d%s", localIP, httpPort, path)
+
+	// Register a temporary handler
+	http.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.Write(audio)
+	})
 
 	// Capture current state
 	vol, err := sonosGetVolume(sonosIP)
@@ -406,7 +526,7 @@ func playWarningOnSonos(sonosIP string) error {
 	sonosSetAVTransportURI(sonosIP, audioURL, "")
 	sonosPlay(sonosIP)
 
-	// Wait for warning to finish (~8 seconds)
+	// Wait for it to finish
 	time.Sleep(9 * time.Second)
 
 	// Restore original volume and input
@@ -547,6 +667,73 @@ func (tc *tvController) turnOff() error {
 	return fmt.Errorf("failed to turn off TV after 3 attempts")
 }
 
+func (tc *tvController) screenshot(outPath string) error {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.tv == nil {
+		if err := tc.connect(); err != nil {
+			return fmt.Errorf("connect: %w", err)
+		}
+	}
+	resp, err := tc.tv.Request("ssap://tv/executeOneShot", nil)
+	if err != nil {
+		return fmt.Errorf("executeOneShot: %w", err)
+	}
+	uri, ok := resp["imageUri"].(string)
+	if !ok || uri == "" {
+		return fmt.Errorf("no imageUri in response")
+	}
+
+	// Download the image (self-signed TLS on the TV)
+	httpClient := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &crypto_tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	imgResp, err := httpClient.Get(uri)
+	if err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	defer imgResp.Body.Close()
+	data, err := io.ReadAll(imgResp.Body)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	if err := os.WriteFile(outPath, data, 0644); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	return nil
+}
+
+func (tc *tvController) screenshotBytes() ([]byte, error) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.tv == nil {
+		if err := tc.connect(); err != nil {
+			return nil, fmt.Errorf("connect: %w", err)
+		}
+	}
+	resp, err := tc.tv.Request("ssap://tv/executeOneShot", nil)
+	if err != nil {
+		return nil, fmt.Errorf("executeOneShot: %w", err)
+	}
+	uri, ok := resp["imageUri"].(string)
+	if !ok || uri == "" {
+		return nil, fmt.Errorf("no imageUri in response")
+	}
+	httpClient := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &crypto_tls.Config{InsecureSkipVerify: true}},
+	}
+	imgResp, err := httpClient.Get(uri)
+	if err != nil {
+		return nil, fmt.Errorf("download: %w", err)
+	}
+	defer imgResp.Body.Close()
+	return io.ReadAll(imgResp.Body)
+}
+
 func (tc *tvController) showToast(msg string) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
@@ -563,14 +750,91 @@ func (tc *tvController) showToast(msg string) {
 // ---------------------------------------------------------------------------
 
 type brainrotMonitor struct {
-	cfg           Config
-	classifier    *core.Agent[BrainrotClassification]
-	tv            *tvController
-	lastVideoID   string             // most recent video we saw
-	activeWarning bool               // a warning/shutdown sequence is in progress
-	warningCancel context.CancelFunc // cancels the warning countdown
-	warningDone   chan struct{}       // closed when warnAndShutdown goroutine exits
-	mu            sync.Mutex
+	cfg              Config
+	classifier       *core.Agent[BrainrotClassification]
+	screenClassifier *core.Agent[ScreenClassification]
+	tv               *tvController
+	lastVideoID      string             // most recent video we saw
+	lastWarningReason string            // reason for the current warning (for dynamic TTS)
+	activeWarning    bool               // a warning/shutdown sequence is in progress
+	warningCancel    context.CancelFunc // cancels the warning countdown
+	warningDone      chan struct{}       // closed when warnAndShutdown goroutine exits
+	mu               sync.Mutex
+}
+
+// screenCheckLoop periodically screenshots the TV and classifies what's on screen.
+// This catches brainrot outside YouTube (Roblox, Netflix, etc.).
+func (m *brainrotMonitor) screenCheckLoop(ctx context.Context) {
+	interval := time.Duration(m.cfg.ScreenCheckInterval) * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.classifyScreen(ctx)
+		}
+	}
+}
+
+func (m *brainrotMonitor) classifyScreen(ctx context.Context) {
+	imgData, err := m.tv.screenshotBytes()
+	if err != nil {
+		slog.Debug("Screen check: screenshot failed", "error", err)
+		return
+	}
+
+	dataURI := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(imgData)
+
+	classCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	result, err := m.screenClassifier.Run(
+		classCtx,
+		"What is on this TV screen? Classify it.",
+		core.WithInitialRequestParts(core.ImagePart{
+			URL:      dataURI,
+			MIMEType: "image/jpeg",
+			Detail:   "low",
+		}),
+	)
+	if err != nil {
+		slog.Warn("Screen check: classification failed", "error", err)
+		return
+	}
+
+	sc := result.Output
+	slog.Info("Screen check",
+		"app", sc.App,
+		"content", sc.Content,
+		"is_brainrot", sc.IsBrainrot,
+		"age_appropriate", sc.AgeAppropriate,
+		"reason", sc.Reason,
+	)
+
+	if !sc.IsBrainrot {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.activeWarning {
+		slog.Warn("BRAINROT DETECTED via screen check",
+			"app", sc.App,
+			"content", sc.Content,
+			"reason", sc.Reason,
+		)
+		m.waitForWarningDone()
+		m.activeWarning = true
+		m.lastWarningReason = sc.Reason
+		warnCtx, warnCancel := context.WithCancel(ctx)
+		m.warningCancel = warnCancel
+		m.warningDone = make(chan struct{})
+		go m.warnAndShutdown(warnCtx)
+	}
 }
 
 func (m *brainrotMonitor) handleNowPlaying(ctx context.Context, e *event.NowPlayingEvent) {
@@ -658,6 +922,7 @@ func (m *brainrotMonitor) handleNowPlaying(ctx context.Context, e *event.NowPlay
 			// If a previous goroutine is still finishing, wait for it
 			m.waitForWarningDone()
 			m.activeWarning = true
+			m.lastWarningReason = classification.Reason
 			warnCtx, cancel := context.WithCancel(ctx)
 			m.warningCancel = cancel
 			m.warningDone = make(chan struct{})
@@ -683,8 +948,11 @@ func (m *brainrotMonitor) warnAndShutdown(ctx context.Context) {
 	// Show visual warning on TV screen
 	m.tv.showToast("BRAINROT DETECTED. Change what you're watching or the TV will turn off in 10 seconds.")
 
-	// Play warning audio — this is not cancellable, it always plays through
-	if err := playWarningOnSonos(m.cfg.SonosIP); err != nil {
+	// Play warning audio — dynamic TTS if ElevenLabs is configured, else embedded MP3
+	m.mu.Lock()
+	reason := m.lastWarningReason
+	m.mu.Unlock()
+	if err := playWarningAudio(m.cfg, reason); err != nil {
 		slog.Error("Failed to play warning", "error", err)
 	}
 
@@ -714,6 +982,40 @@ func (m *brainrotMonitor) warnAndShutdown(ctx context.Context) {
 	}
 	m.activeWarning = false
 	m.mu.Unlock()
+
+	// Before turning off, take a fresh screenshot and re-classify.
+	// If she switched to something OK, give her a pass.
+	if m.screenClassifier != nil {
+		imgData, err := m.tv.screenshotBytes()
+		if err == nil {
+			dataURI := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(imgData)
+			classCtx, classCancel := context.WithTimeout(ctx, 30*time.Second)
+			result, err := m.screenClassifier.Run(
+				classCtx,
+				"What is on this TV screen? Classify it.",
+				core.WithInitialRequestParts(core.ImagePart{
+					URL:      dataURI,
+					MIMEType: "image/jpeg",
+					Detail:   "low",
+				}),
+			)
+			classCancel()
+
+			if err == nil && !result.Output.IsBrainrot {
+				slog.Info("Re-check: content changed to something OK — standing down",
+					"app", result.Output.App,
+					"content", result.Output.Content,
+				)
+				return
+			}
+			if err == nil {
+				slog.Warn("Re-check: still brainrot",
+					"app", result.Output.App,
+					"content", result.Output.Content,
+				)
+			}
+		}
+	}
 
 	// Time's up. Turn off the TV.
 	slog.Warn("Time's up. Turning off TV.")
@@ -756,21 +1058,93 @@ func (m *brainrotMonitor) waitForWarningDone() {
 // ---------------------------------------------------------------------------
 
 func main() {
+	screenshotPath := flag.String("screenshot", "", "Take a screenshot of the TV and save to this path, then exit")
+	classifyScreen := flag.Bool("classify", false, "Screenshot the TV, classify the content with GPT vision, and print structured JSON")
+	flag.Parse()
+
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
 
 	cfg := loadConfig()
 
+	// Screenshot mode — just grab the TV screen and exit
+	if *screenshotPath != "" {
+		if cfg.LGTVIP == "" {
+			log.Fatal("Config incomplete: lg_tv_ip is required for screenshots.")
+		}
+		tvCtrl := newTVController(cfg.LGTVIP, cfg.LGTVKey)
+		if err := tvCtrl.screenshot(*screenshotPath); err != nil {
+			log.Fatalf("Screenshot failed: %v", err)
+		}
+		fmt.Println(*screenshotPath)
+		return
+	}
+
+	// Classify mode — screenshot + GPT vision classification
+	if *classifyScreen {
+		if cfg.LGTVIP == "" {
+			log.Fatal("Config incomplete: lg_tv_ip is required for classification.")
+		}
+
+		// Take screenshot to temp file
+		tmpFile, err := os.CreateTemp("", "brainrot-screen-*.jpg")
+		if err != nil {
+			log.Fatalf("Failed to create temp file: %v", err)
+		}
+		tmpPath := tmpFile.Name()
+		tmpFile.Close()
+		defer os.Remove(tmpPath)
+
+		tvCtrl := newTVController(cfg.LGTVIP, cfg.LGTVKey)
+		if err := tvCtrl.screenshot(tmpPath); err != nil {
+			log.Fatalf("Screenshot failed: %v", err)
+		}
+
+		// Read image and encode as data URI
+		imgData, err := os.ReadFile(tmpPath)
+		if err != nil {
+			log.Fatalf("Failed to read screenshot: %v", err)
+		}
+		dataURI := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(imgData)
+
+		// Set up LLM
+		provider, err := newProvider()
+		if err != nil {
+			log.Fatalf("Failed to initialize LLM: %v", err)
+		}
+		agent := newScreenClassifier(provider)
+
+		// Classify with vision
+		result, err := agent.Run(
+			context.Background(),
+			"What is on this TV screen? Classify it.",
+			core.WithInitialRequestParts(core.ImagePart{
+				URL:      dataURI,
+				MIMEType: "image/jpeg",
+				Detail:   "high",
+			}),
+		)
+		if err != nil {
+			log.Fatalf("Classification failed: %v", err)
+		}
+
+		out, _ := json.MarshalIndent(result.Output, "", "  ")
+		fmt.Println(string(out))
+		return
+	}
+
 	if cfg.SonosIP == "" || cfg.LGTVIP == "" {
 		log.Fatalf("Config incomplete: sonos_ip and lg_tv_ip are required.\nCopy config.sample.json to config.json and fill in your device IPs.")
 	}
 
 	slog.Info("Initializing brainrot classifier...")
-	classifier, err := newClassifier()
+	provider, err := newProvider()
 	if err != nil {
-		log.Fatalf("Failed to initialize classifier: %v", err)
+		log.Fatalf("Failed to initialize LLM provider: %v", err)
 	}
+	classifier := newClassifier(provider)
+	screenClassifier := newScreenClassifier(provider)
 
 	startHTTPServer()
 	slog.Info("Warning audio server started", "port", httpPort)
@@ -824,9 +1198,15 @@ func main() {
 	go tvCtrl.keepAlive(ctx)
 
 	monitor := &brainrotMonitor{
-		cfg:          cfg,
-		classifier:   classifier,
-		tv:           tvCtrl,
+		cfg:              cfg,
+		classifier:       classifier,
+		screenClassifier: screenClassifier,
+		tv:               tvCtrl,
+	}
+
+	if cfg.ScreenCheckInterval > 0 {
+		slog.Info("Screen check enabled", "interval_seconds", cfg.ScreenCheckInterval)
+		go monitor.screenCheckLoop(ctx)
 	}
 
 	// Reconnect loop — when the TV turns off or YouTube closes, the Lounge

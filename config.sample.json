@@ -2,5 +2,6 @@
   "sonos_ip": "192.168.0.XXX",
   "lg_tv_ip": "192.168.0.XXX",
   "lg_tv_key": "",
-  "warning_delay_seconds": 10
+  "warning_delay_seconds": 10,
+  "screen_check_interval_seconds": 300
 }
